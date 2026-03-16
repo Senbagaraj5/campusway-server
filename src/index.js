@@ -5,7 +5,13 @@ const mssql = require('mssql');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: false,
+}));
+app.options('*', cors());
 app.use(bodyParser.json());
 
 // Add this after app.use(bodyParser.json()):
@@ -26,10 +32,10 @@ app.get('/', (req, res) => {
 });
 
 const config = {
-  user: 'facultyschedule',
-  password: 'Wise@3908',
-  server: '103.207.1.87',
-  database: 'facultyschedule',
+  user: process.env.DB_USER || 'facultyschedule',
+  password: process.env.DB_PASS || 'Wise@3908',
+  server: process.env.DB_HOST || '103.207.1.87',
+  database: process.env.DB_NAME || 'facultyschedule',
   port: 1433,
   options: {
     encrypt: false,
@@ -263,6 +269,46 @@ app.post('/api/students', async (req, res) => {
 // ==================
 // DRIVER ROUTES
 // ==================
+
+// Driver Login
+app.post('/api/driver/login', async (req, res) => {
+  const busNo = req.body.busNo || req.body.busNumber;
+  const password = req.body.password;
+
+  if (!busNo || !password) {
+    return res.status(400).json({
+      success: false,
+      error: 'Bus number and password are required'
+    });
+  }
+
+  try {
+    const result = await pool.request()
+      .input('busNumber', mssql.NVarChar, String(busNo))
+      .input('license', mssql.NVarChar, password.toUpperCase().trim())
+      .query(`
+        SELECT Id, Name, BusNumber, LicenseNumber, IsActive
+        FROM CW_Drivers
+        WHERE BusNumber = @busNumber 
+          AND LicenseNumber = @license 
+          AND IsActive = 1
+      `);
+    if (result.recordset.length === 0)
+      return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    const row = result.recordset[0];
+    res.json({
+      success: true,
+      bus: {
+        BusNo: Number(row.BusNumber),
+        Registration: row.LicenseNumber,
+        Route: row.Name || ''
+      }
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ success: false, error: 'Server error. Please try again later.' });
+  }
+});
 
 // Get all drivers
 app.get('/api/drivers', async (req, res) => {
@@ -529,54 +575,220 @@ app.get('/api/trips/history', async (req, res) => {
 });
 
 // ==================
-// ADMIN ROUTES
+// CAMPUSWAY BUS TRACKING ROUTES
 // ==================
 
-// Dashboard stats
-app.get('/api/admin/dashboard', async (req, res) => {
+// Get All Buses (Admin) — used by DriverLogin.tsx
+app.get('/api/admin/buses', async (req, res) => {
   try {
-    const students = await pool.request()
-      .query('SELECT COUNT(*) as count FROM dbo.CW_Students');
+    // Robustness: CW_BusLocation might not exist on some deployments
+    const hasBusLocation = await pool.request().query(`
+      SELECT 1 AS ok
+      FROM sys.objects
+      WHERE object_id = OBJECT_ID('dbo.CW_BusLocation')
+        AND type = 'U'
+    `);
 
-    const drivers = await pool.request()
-      .query('SELECT COUNT(*) as count FROM dbo.CW_Drivers');
+    const queryWithOnline = `
+      SELECT 
+        CAST(d.BusNumber AS INT) AS BusNo,
+        d.BusNumber,
+        d.LicenseNumber AS Registration,
+        COALESCE(r.RouteName, d.Name, 'Route ' + d.BusNumber) AS Route,
+        d.IsActive,
+        CASE WHEN b.BusNo IS NOT NULL THEN 1 ELSE 0 END AS IsOnline
+      FROM CW_Drivers d
+      LEFT JOIN CW_Routes r ON r.BusNumber = d.BusNumber
+      LEFT JOIN CW_BusLocation b ON CAST(b.BusNo AS NVARCHAR(10)) = d.BusNumber
+      WHERE TRY_CAST(d.BusNumber AS INT) IS NOT NULL
+      ORDER BY CAST(d.BusNumber AS INT)
+    `;
 
-    const activeTrips = await pool.request()
-      .query(`SELECT COUNT(*) as count FROM dbo.CW_Trips 
-              WHERE Status = 'active'`);
+    const queryWithoutOnline = `
+      SELECT 
+        CAST(d.BusNumber AS INT) AS BusNo,
+        d.BusNumber,
+        d.LicenseNumber AS Registration,
+        COALESCE(r.RouteName, d.Name, 'Route ' + d.BusNumber) AS Route,
+        d.IsActive,
+        0 AS IsOnline
+      FROM CW_Drivers d
+      LEFT JOIN CW_Routes r ON r.BusNumber = d.BusNumber
+      WHERE TRY_CAST(d.BusNumber AS INT) IS NOT NULL
+      ORDER BY CAST(d.BusNumber AS INT)
+    `;
 
-    const totalTrips = await pool.request()
-      .query('SELECT COUNT(*) as count FROM dbo.CW_Trips');
-
-    res.json({
-      ok: true,
-      data: {
-        totalStudents: students.recordset[0].count,
-        totalDrivers: drivers.recordset[0].count,
-        activeTrips: activeTrips.recordset[0].count,
-        totalTrips: totalTrips.recordset[0].count
-      }
-    });
+    const result = await pool.request().query(
+      hasBusLocation.recordset.length > 0 ? queryWithOnline : queryWithoutOnline
+    );
+    res.json({ buses: result.recordset });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    console.error('Admin buses error:', err);
+    res.status(500).json({ error: 'Server error', detail: err.message });
   }
 });
 
-// Get all checkins
-app.get('/api/admin/checkins', async (req, res) => {
+// Update bus location (from DriverScreen)
+app.post('/api/bus/location', async (req, res) => {
+  const { busNo, lat, lng, speed } = req.body;
+  try {
+    await pool.request()
+      .input('busNo', mssql.Int, busNo)
+      .input('lat', mssql.Float, lat)
+      .input('lng', mssql.Float, lng)
+      .input('speed', mssql.Float, speed || 0)
+      .query(`
+        IF EXISTS (SELECT 1 FROM CW_BusLocation WHERE BusNo = @busNo)
+        BEGIN
+          UPDATE CW_BusLocation 
+          SET Latitude = @lat, Longitude = @lng, Speed = @speed, UpdatedAt = GETDATE(), IsOnline = 1
+          WHERE BusNo = @busNo
+        END
+        ELSE
+        BEGIN
+          INSERT INTO CW_BusLocation (BusNo, Latitude, Longitude, Speed, IsOnline)
+          VALUES (@busNo, @lat, @lng, @speed, 1)
+        END
+      `);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Driver disconnect
+app.post('/api/bus/disconnect', async (req, res) => {
+  const { busNo } = req.body;
+  try {
+    await pool.request()
+      .input('busNo', mssql.Int, busNo)
+      .query("DELETE FROM CW_BusLocation WHERE BusNo = @busNo");
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Get all live buses
+app.get('/api/buses/live', async (req, res) => {
+  try {
+    const result = await pool.request().query(`
+      SELECT L.*, D.Registration, D.Route 
+      FROM CW_BusLocation L
+      INNER JOIN CW_Drivers D ON L.BusNo = D.BusNo
+      WHERE D.IsActive = 1
+    `);
+    res.json({ buses: result.recordset });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Get single bus location
+app.get('/api/bus/:busNo/location', async (req, res) => {
+  const { busNo } = req.params;
   try {
     const result = await pool.request()
+      .input('busNo', mssql.Int, busNo)
       .query(`
-        SELECT TOP 100 * FROM dbo.CW_DriverCheckins
-        ORDER BY CreatedAt DESC
+        SELECT L.*, D.Registration, D.Route 
+        FROM CW_BusLocation L
+        INNER JOIN CW_Drivers D ON L.BusNo = D.BusNo
+        WHERE L.BusNo = @busNo
       `);
-    res.json({ ok: true, data: result.recordset });
+    if (result.recordset.length > 0) {
+      res.json({ online: true, bus: result.recordset[0] });
+    } else {
+      res.json({ online: false });
+    }
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-const PORT = 4000;
-app.listen(PORT, () => {
+// Update bus (admin)
+app.put('/api/admin/bus/:busNo', async (req, res) => {
+  const { busNo } = req.params;
+  const { registration, route, isActive } = req.body;
+  try {
+    const request = pool.request();
+    let query = "UPDATE CW_Drivers SET ";
+    let updates = [];
+    if (registration !== undefined) {
+      request.input('reg', mssql.NVarChar, registration);
+      updates.push("Registration = @reg");
+    }
+    if (route !== undefined) {
+      request.input('route', mssql.NVarChar, route);
+      updates.push("Route = @route");
+    }
+    if (isActive !== undefined) {
+      request.input('active', mssql.Bit, isActive ? 1 : 0);
+      updates.push("IsActive = @active");
+    }
+    if (updates.length === 0) return res.status(400).json({ error: "No fields to update" });
+    query += updates.join(", ") + " WHERE BusNo = @busNo";
+    request.input('busNo', mssql.Int, busNo);
+    await request.query(query);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Bus location history
+app.get('/api/bus/:busNo/history', async (req, res) => {
+  const { busNo } = req.params;
+  try {
+    const result = await pool.request()
+      .input('busNo', mssql.Int, busNo)
+      .query("SELECT TOP 100 * FROM CW_LocationHistory WHERE BusNo = @busNo ORDER BY RecordedAt DESC");
+    res.json(result.recordset);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================
+// SEED CW_Drivers IF EMPTY
+// ==================
+async function seedDrivers() {
+  try {
+    const check = await pool.request()
+      .query("SELECT COUNT(*) AS cnt FROM CW_Drivers");
+    if (check.recordset[0].cnt === 0) {
+      console.log("Seeding CW_Drivers...");
+      await pool.request().query(`
+        INSERT INTO CW_Drivers (BusNo, Registration, Route, IsActive) VALUES
+        (2,  'TN63AJ8602', 'Neivasal', 1),
+        (3,  'TN63AK1260', 'SS.Kottai', 1),
+        (4,  'TN63AK1264', 'Illupakudi', 1),
+        (6,  'TN63AJ8845', 'Senjai', 1),
+        (7,  'TN63AL8220', 'Thirupathur Pudhu Theru', 1),
+        (8,  'TN63AJ8903', 'Singampunari', 1),
+        (9,  'TN63AL8156', 'Spare', 0),
+        (11, 'TN63AL9236', 'Spare', 0),
+        (12, 'TN63AJ8611', 'Spare', 0),
+        (13, 'TN63AJ8570', 'Spare', 0),
+        (14, 'TN63BA0058', 'Velangudi', 1),
+        (15, 'TN63BA0204', 'Karaikudi', 1),
+        (16, 'TN63BA3179', 'Eriyur', 1),
+        (17, 'TN63BC3589', 'Akilmanai Thirupathur', 1),
+        (18, 'TN63BC3805', 'Sembanur', 1),
+        (19, 'TN63BD8042', 'Kotaiyur', 1),
+        (20, 'TN63BE0936', 'Keelasevalpatti', 1),
+        (34, 'TN55AC5864', 'Kallutimedu', 1),
+        (50, 'TN55BC5526', 'Elanthaimangalam', 1)
+      `);
+      console.log("✅ CW_Drivers seeded with 19 buses.");
+    }
+  } catch (err) {
+    console.error("Seed check (non-fatal):", err.message);
+  }
+}
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, async () => {
+  await seedDrivers();
   console.log(`✅ CampusWay Server running on port ${PORT}`);
 });
