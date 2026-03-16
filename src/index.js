@@ -486,6 +486,28 @@ app.post('/api/trips/:tripId/location', async (req, res) => {
   }
 });
 
+// Alias for client tracking telemetry
+app.post('/api/location-history', async (req, res) => {
+  const { busId, busLat, busLng, studentLat, studentLng, distanceKm, durationMin } = req.body;
+  try {
+    // Storing as a general telemetry log in LocationHistory without a specific tripId
+    await pool.request()
+      .input('id', mssql.UniqueIdentifier, uuidv4())
+      .input('bus', mssql.NVarChar(10), String(busId))
+      .input('lat', mssql.Decimal(10, 8), busLat)
+      .input('lng', mssql.Decimal(11, 8), busLng)
+      .input('recordedAt', mssql.DateTimeOffset, new Date().toISOString())
+      .query(`
+        INSERT INTO dbo.CW_LocationHistory
+        (Id, BusNumber, Latitude, Longitude, RecordedAt)
+        VALUES (@id, @bus, @lat, @lng, @recordedAt)
+      `);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Get trip history
 app.get('/api/trips/history', async (req, res) => {
   const { bus } = req.query;
