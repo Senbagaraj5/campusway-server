@@ -7,9 +7,10 @@
     "dev": "nodemon src/index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
     "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+
     "mssql": "^10.0.1",
     "uuid": "^9.0.0"
   },
